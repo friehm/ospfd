@@ -1023,7 +1023,7 @@ orig_rtr_lsa(struct area *area)
 	memcpy(ibuf_seek(buf, LS_CKSUM_OFFSET, sizeof(chksum)),
 	    &chksum, sizeof(chksum));
 
-	if (self && num_links)
+	if (self)
 		imsg_compose_event(iev_rde, IMSG_LS_UPD, self->peerid, 0,
 		    -1, buf->buf, ibuf_size(buf));
 	else

@@ -306,10 +306,6 @@ lsa_router_check(struct lsa *lsa, u_int16_t len)
 	}
 
 	nlinks = ntohs(lsa->data.rtr.nlinks);
-	if (nlinks == 0) {
-		log_warnx("lsa_check: invalid LSA router packet");
-		return (0);
-	}
 	for (i = 0; i < nlinks; i++) {
 		rtr_link = (struct lsa_rtr_link *)(buf + off);
 		off += sizeof(struct lsa_rtr_link);
