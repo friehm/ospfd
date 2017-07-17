@@ -1,4 +1,4 @@
-/*	$OpenBSD: lsupdate.c,v 1.42 2014/12/18 19:26:46 tedu Exp $ */
+/*	$OpenBSD: lsupdate.c,v 1.45 2016/12/26 17:38:14 jca Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -329,8 +329,15 @@ ls_retrans_list_del(struct nbr *nbr, struct lsa_hdr *lsa_hdr)
 
 	if ((le = ls_retrans_list_get(nbr, lsa_hdr)) == NULL)
 		return (-1);
+	/*
+	 * Compare LSA with the Ack by comparing not only the seq_num and
+	 * checksum but also the age field.  Since we only care about MAX_AGE
+	 * vs. non-MAX_AGE LSA, a simple >= comparison is good enough.  This
+	 * ensures that a LSA withdrawal is not acked by a previous update.
+	 */
 	if (lsa_hdr->seq_num == le->le_ref->hdr.seq_num &&
-	    lsa_hdr->ls_chksum == le->le_ref->hdr.ls_chksum) {
+	    lsa_hdr->ls_chksum == le->le_ref->hdr.ls_chksum &&
+	    ntohs(lsa_hdr->age) >= ntohs(le->le_ref->hdr.age)) {
 		ls_retrans_list_free(nbr, le);
 		return (0);
 	}
@@ -485,7 +492,7 @@ ls_retrans_timer(int fd, short event, void *bula)
 		if (add_ls_update(buf, nbr->iface, le->le_ref->data,
 		    le->le_ref->len, d) == 0) {
 			if (nlsa == 0) {
-				/* something bad happend retry later */
+				/* something bad happened retry later */
 				log_warnx("ls_retrans_timer: sending LS update "
 				    "to neighbor ID %s failed",
 				    inet_ntoa(nbr->id));
@@ -550,7 +557,7 @@ lsa_cache_init(u_int32_t hashsize)
 	lsacache.hashmask = hs - 1;
 }
 
-uint32_t
+static uint32_t
 lsa_hash_hdr(const struct lsa_hdr *hdr)
 {
 	return SipHash24(&lsacachekey, hdr, sizeof(*hdr));

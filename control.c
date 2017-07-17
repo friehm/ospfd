@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.40 2014/07/11 16:43:33 krw Exp $ */
+/*	$OpenBSD: control.c,v 1.44 2017/01/24 04:24:25 benno Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -45,7 +45,8 @@ control_init(char *path)
 	int			 fd;
 	mode_t			 old_umask;
 
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+	if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    0)) == -1) {
 		log_warn("control_init: socket");
 		return (-1);
 	}
@@ -77,7 +78,6 @@ control_init(char *path)
 		return (-1);
 	}
 
-	session_socket_blockmode(fd, BM_NONBLOCK);
 	control_state.fd = fd;
 
 	return (0);
@@ -124,8 +124,8 @@ control_accept(int listenfd, short event, void *bula)
 		return;
 
 	len = sizeof(sun);
-	if ((connfd = accept(listenfd,
-	    (struct sockaddr *)&sun, &len)) == -1) {
+	if ((connfd = accept4(listenfd, (struct sockaddr *)&sun, &len,
+	    SOCK_CLOEXEC | SOCK_NONBLOCK)) == -1) {
 		/*
 		 * Pause accept if we are out of file descriptors, or
 		 * libevent will haunt us here too.
@@ -140,8 +140,6 @@ control_accept(int listenfd, short event, void *bula)
 			log_warn("control_accept: accept");
 		return;
 	}
-
-	session_socket_blockmode(connfd, BM_NONBLOCK);
 
 	if ((c = calloc(1, sizeof(struct ctl_conn))) == NULL) {
 		log_warn("control_accept");
@@ -164,9 +162,10 @@ control_connbyfd(int fd)
 {
 	struct ctl_conn	*c;
 
-	for (c = TAILQ_FIRST(&ctl_conns); c != NULL && c->iev.ibuf.fd != fd;
-	    c = TAILQ_NEXT(c, entry))
-		;	/* nothing */
+	TAILQ_FOREACH(c, &ctl_conns, entry) {
+		if (c->iev.ibuf.fd == fd)
+			break;
+	}
 
 	return (c);
 }
@@ -176,9 +175,10 @@ control_connbypid(pid_t pid)
 {
 	struct ctl_conn	*c;
 
-	for (c = TAILQ_FIRST(&ctl_conns); c != NULL && c->iev.ibuf.pid != pid;
-	    c = TAILQ_NEXT(c, entry))
-		;	/* nothing */
+	TAILQ_FOREACH(c, &ctl_conns, entry) {
+		if (c->iev.ibuf.pid == pid)
+			break;
+	}
 
 	return (c);
 }
@@ -224,7 +224,8 @@ control_dispatch_imsg(int fd, short event, void *bula)
 	}
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(&c->iev.ibuf)) == -1 || n == 0) {
+		if (((n = imsg_read(&c->iev.ibuf)) == -1 && errno != EAGAIN) ||
+		    n == 0) {
 			control_close(fd);
 			return;
 		}
@@ -300,7 +301,7 @@ control_dispatch_imsg(int fd, short event, void *bula)
 			    imsg.data, imsg.hdr.len - IMSG_HEADER_SIZE);
 
 			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			log_setverbose(verbose);
 			break;
 		default:
 			log_debug("control_dispatch_imsg: "
@@ -323,21 +324,4 @@ control_imsg_relay(struct imsg *imsg)
 
 	return (imsg_compose_event(&c->iev, imsg->hdr.type, 0, imsg->hdr.pid,
 	    -1, imsg->data, imsg->hdr.len - IMSG_HEADER_SIZE));
-}
-
-void
-session_socket_blockmode(int fd, enum blockmodes bm)
-{
-	int	flags;
-
-	if ((flags = fcntl(fd, F_GETFL, 0)) == -1)
-		fatal("fcntl F_GETFL");
-
-	if (bm == BM_NONBLOCK)
-		flags |= O_NONBLOCK;
-	else
-		flags &= ~O_NONBLOCK;
-
-	if ((flags = fcntl(fd, F_SETFL, flags)) == -1)
-		fatal("fcntl F_SETFL");
 }

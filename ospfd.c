@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfd.c,v 1.82 2015/01/16 06:40:19 deraadt Exp $ */
+/*	$OpenBSD: ospfd.c,v 1.94 2017/01/24 04:24:25 benno Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/sysctl.h>
+#include <syslog.h>
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -48,8 +49,7 @@
 
 void		main_sig_handler(int, short, void *);
 __dead void	usage(void);
-void		ospfd_shutdown(void);
-int		check_child(pid_t, const char *);
+__dead void	ospfd_shutdown(void);
 
 void	main_dispatch_ospfe(int, short, void *);
 void	main_dispatch_rde(int, short, void *);
@@ -75,29 +75,12 @@ pid_t			 rde_pid = 0;
 void
 main_sig_handler(int sig, short event, void *arg)
 {
-	/*
-	 * signal handler rules don't apply, libevent decouples for us
-	 */
-
-	int	die = 0;
-
+	/* signal handler rules don't apply, libevent decouples for us */
 	switch (sig) {
 	case SIGTERM:
 	case SIGINT:
-		die = 1;
-		/* FALLTHROUGH */
-	case SIGCHLD:
-		if (check_child(ospfe_pid, "ospf engine")) {
-			ospfe_pid = 0;
-			die = 1;
-		}
-		if (check_child(rde_pid, "route decision engine")) {
-			rde_pid = 0;
-			die = 1;
-		}
-		if (die)
-			ospfd_shutdown();
-		break;
+		ospfd_shutdown();
+		/* NOTREACHED */
 	case SIGHUP:
 		if (ospf_reload() == -1)
 			log_warnx("configuration reload failed");
@@ -124,7 +107,7 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	struct event		 ev_sigint, ev_sigterm, ev_sigchld, ev_sighup;
+	struct event		 ev_sigint, ev_sigterm, ev_sighup;
 	struct area		*a;
 	int			 ch, opts = 0;
 	int			 debug = 0;
@@ -137,8 +120,9 @@ main(int argc, char *argv[])
 	ospfd_process = PROC_MAIN;
 	sockname = OSPFD_SOCKET;
 
-	log_init(1);	/* log to stderr until daemonized */
-	log_verbose(1);
+	log_init(1, LOG_DAEMON);	/* log to stderr until daemonized */
+	log_procinit(log_procnames[ospfd_process]);
+	log_setverbose(1);
 
 	while ((ch = getopt(argc, argv, "cdD:f:ns:v")) != -1) {
 		switch (ch) {
@@ -192,13 +176,12 @@ main(int argc, char *argv[])
 		opts |= OSPFD_OPT_STUB_ROUTER;
 	}
 
-
 	/* fetch interfaces early */
 	kif_init();
 
 	/* parse config file */
 	if ((ospfd_conf = parse_config(conffile, opts)) == NULL) {
-		kr_shutdown();
+		kif_clear();
 		exit(1);
 	}
 	ospfd_conf->csock = sockname;
@@ -208,7 +191,7 @@ main(int argc, char *argv[])
 			print_config(ospfd_conf);
 		else
 			fprintf(stderr, "configuration OK\n");
-		kr_shutdown();
+		kif_clear();
 		exit(0);
 	}
 
@@ -220,27 +203,23 @@ main(int argc, char *argv[])
 	if (getpwnam(OSPFD_USER) == NULL)
 		errx(1, "unknown user %s", OSPFD_USER);
 
-	log_init(debug);
-	log_verbose(ospfd_conf->opts & OSPFD_OPT_VERBOSE);
+	log_init(debug, LOG_DAEMON);
+	log_setverbose(ospfd_conf->opts & OSPFD_OPT_VERBOSE);
 
 	if (!debug)
 		daemon(1, 0);
 
 	log_info("startup");
 
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC,
-	    pipe_parent2ospfe) == -1)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    PF_UNSPEC, pipe_parent2ospfe) == -1)
 		fatal("socketpair");
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_parent2rde) == -1)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    PF_UNSPEC, pipe_parent2rde) == -1)
 		fatal("socketpair");
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_ospfe2rde) == -1)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    PF_UNSPEC, pipe_ospfe2rde) == -1)
 		fatal("socketpair");
-	session_socket_blockmode(pipe_parent2ospfe[0], BM_NONBLOCK);
-	session_socket_blockmode(pipe_parent2ospfe[1], BM_NONBLOCK);
-	session_socket_blockmode(pipe_parent2rde[0], BM_NONBLOCK);
-	session_socket_blockmode(pipe_parent2rde[1], BM_NONBLOCK);
-	session_socket_blockmode(pipe_ospfe2rde[0], BM_NONBLOCK);
-	session_socket_blockmode(pipe_ospfe2rde[1], BM_NONBLOCK);
 
 	/* start children */
 	rde_pid = rde(ospfd_conf, pipe_parent2rde, pipe_ospfe2rde,
@@ -248,19 +227,14 @@ main(int argc, char *argv[])
 	ospfe_pid = ospfe(ospfd_conf, pipe_parent2ospfe, pipe_ospfe2rde,
 	    pipe_parent2rde);
 
-	/* show who we are */
-	setproctitle("parent");
-
 	event_init();
 
 	/* setup signal handler */
 	signal_set(&ev_sigint, SIGINT, main_sig_handler, NULL);
 	signal_set(&ev_sigterm, SIGTERM, main_sig_handler, NULL);
-	signal_set(&ev_sigchld, SIGCHLD, main_sig_handler, NULL);
 	signal_set(&ev_sighup, SIGHUP, main_sig_handler, NULL);
 	signal_add(&ev_sigint, NULL);
 	signal_add(&ev_sigterm, NULL);
-	signal_add(&ev_sigchld, NULL);
 	signal_add(&ev_sighup, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
@@ -293,7 +267,7 @@ main(int argc, char *argv[])
 	    ospfd_conf->rdomain) == -1)
 		fatalx("kr_init failed");
 
-	/* remove unneded stuff from config */
+	/* remove unneeded stuff from config */
 	while ((a = LIST_FIRST(&ospfd_conf->area_list)) != NULL) {
 		LIST_REMOVE(a, entry);
 		area_del(a);
@@ -306,17 +280,18 @@ main(int argc, char *argv[])
 	return (0);
 }
 
-void
+__dead void
 ospfd_shutdown(void)
 {
-	pid_t		 	 pid;
+	pid_t			 pid;
+	int			 status;
 	struct redistribute	*r;
 
-	if (ospfe_pid)
-		kill(ospfe_pid, SIGTERM);
-
-	if (rde_pid)
-		kill(rde_pid, SIGTERM);
+	/* close pipes */
+	msgbuf_clear(&iev_ospfe->ibuf.w);
+	close(iev_ospfe->ibuf.fd);
+	msgbuf_clear(&iev_rde->ibuf.w);
+	close(iev_rde->ibuf.fd);
 
 	control_cleanup(ospfd_conf->csock);
 	while ((r = SIMPLEQ_FIRST(&ospfd_conf->redist_list)) != NULL) {
@@ -326,40 +301,24 @@ ospfd_shutdown(void)
 	kr_shutdown();
 	carp_demote_shutdown();
 
+	log_debug("waiting for children to terminate");
 	do {
-		if ((pid = wait(NULL)) == -1 &&
-		    errno != EINTR && errno != ECHILD)
-			fatal("wait");
+		pid = wait(&status);
+		if (pid == -1) {
+			if (errno != EINTR && errno != ECHILD)
+				fatal("wait");
+		} else if (WIFSIGNALED(status))
+			log_warnx("%s terminated; signal %d",
+			    (pid == rde_pid) ? "route decision engine" :
+			    "ospf engine", WTERMSIG(status));
 	} while (pid != -1 || (pid == -1 && errno == EINTR));
 
-	msgbuf_clear(&iev_ospfe->ibuf.w);
 	free(iev_ospfe);
-	msgbuf_clear(&iev_rde->ibuf.w);
 	free(iev_rde);
 	free(ospfd_conf);
 
 	log_info("terminating");
 	exit(0);
-}
-
-int
-check_child(pid_t pid, const char *pname)
-{
-	int	status;
-
-	if (waitpid(pid, &status, WNOHANG) > 0) {
-		if (WIFEXITED(status)) {
-			log_warnx("lost child: %s exited", pname);
-			return (1);
-		}
-		if (WIFSIGNALED(status)) {
-			log_warnx("lost child: %s terminated; signal %d",
-			    pname, WTERMSIG(status));
-			return (1);
-		}
-	}
-
-	return (0);
 }
 
 /* imsg handling */
@@ -377,7 +336,7 @@ main_dispatch_ospfe(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -433,7 +392,7 @@ main_dispatch_ospfe(int fd, short event, void *bula)
 		case IMSG_CTL_LOG_VERBOSE:
 			/* already checked by ospfe */
 			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			log_setverbose(verbose);
 			break;
 		default:
 			log_debug("main_dispatch_ospfe: error handling imsg %d",
@@ -464,7 +423,7 @@ main_dispatch_rde(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -515,13 +474,15 @@ main_dispatch_rde(int fd, short event, void *bula)
 void
 main_imsg_compose_ospfe(int type, pid_t pid, void *data, u_int16_t datalen)
 {
-	imsg_compose_event(iev_ospfe, type, 0, pid, -1, data, datalen);
+	if (iev_ospfe)
+		imsg_compose_event(iev_ospfe, type, 0, pid, -1, data, datalen);
 }
 
 void
 main_imsg_compose_rde(int type, pid_t pid, void *data, u_int16_t datalen)
 {
-	imsg_compose_event(iev_rde, type, 0, pid, -1, data, datalen);
+	if (iev_rde)
+		imsg_compose_event(iev_rde, type, 0, pid, -1, data, datalen);
 }
 
 void
@@ -825,6 +786,8 @@ merge_interfaces(struct area *a, struct area *xa)
 			    i->name);
 			if (ospfd_process == PROC_OSPF_ENGINE)
 				if_fsm(i, IF_EVT_DOWN);
+			else if (ospfd_process == PROC_RDE_ENGINE)
+				rde_nbr_iface_del(i);
 			LIST_REMOVE(i, entry);
 			if_del(i);
 		}
@@ -862,7 +825,7 @@ merge_interfaces(struct area *a, struct area *xa)
 			i->self->priority = i->priority;
 		i->flags = xi->flags; /* needed? */
 		i->type = xi->type; /* needed? */
-		i->media_type = xi->media_type; /* needed? */
+		i->if_type = xi->if_type; /* needed? */
 		i->linkstate = xi->linkstate; /* needed? */
 
 		i->auth_type = xi->auth_type;

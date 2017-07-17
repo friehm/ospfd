@@ -1,4 +1,4 @@
-/*	$OpenBSD: interface.c,v 1.75 2012/05/14 10:17:21 sthen Exp $ */
+/*	$OpenBSD: interface.c,v 1.81 2015/12/05 12:20:13 claudio Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -136,8 +136,10 @@ if_fsm(struct iface *iface, enum iface_event event)
 	if (new_state != 0)
 		iface->state = new_state;
 
-	if (iface->state != old_state)
+	if (iface->state != old_state) {
+		area_track(iface->area);
 		orig_rtr_lsa(iface->area);
+	}
 
 	if (old_state & (IF_STA_MULTI | IF_STA_POINTTOPOINT) &&
 	    (iface->state & (IF_STA_MULTI | IF_STA_POINTTOPOINT)) == 0)
@@ -196,9 +198,10 @@ if_new(struct kif *kif, struct kif_addr *ka)
 	/* get mtu, index and flags */
 	iface->mtu = kif->mtu;
 	iface->ifindex = kif->ifindex;
+	iface->rdomain = kif->rdomain;
 	iface->flags = kif->flags;
 	iface->linkstate = kif->link_state;
-	iface->media_type = kif->media_type;
+	iface->if_type = kif->if_type;
 	iface->baudrate = kif->baudrate;
 
 	/* set address, mask and p2p addr */
@@ -239,9 +242,6 @@ if_del(struct iface *iface)
 void
 if_init(struct ospfd_conf *xconf, struct iface *iface)
 {
-	struct ifreq	ifr;
-	u_int		rdomain;
-
 	/* init the dummy local neighbor */
 	iface->self = nbr_new(ospfe_router_id(), iface, 1);
 
@@ -251,18 +251,6 @@ if_init(struct ospfd_conf *xconf, struct iface *iface)
 	evtimer_set(&iface->wait_timer, if_wait_timer, iface);
 
 	iface->fd = xconf->ospf_socket;
-
-	strlcpy(ifr.ifr_name, iface->name, sizeof(ifr.ifr_name));
-	if (ioctl(iface->fd, SIOCGIFRDOMAIN, (caddr_t)&ifr) == -1)
-		rdomain = 0;
-	else {
-		rdomain = ifr.ifr_rdomainid;
-		if (setsockopt(iface->fd, SOL_SOCKET, SO_RTABLE,
-		    &rdomain, sizeof(rdomain)) == -1)
-			fatal("failed to set rdomain");
-	}
-	if (rdomain != xconf->rdomain)
-		fatalx("interface rdomain mismatch");
 
 	ospfe_demote_iface(iface, 0);
 }
@@ -338,11 +326,13 @@ if_act_start(struct iface *iface)
 	struct in_addr		 addr;
 	struct timeval		 now;
 
-	if (!((iface->flags & IFF_UP) &&
-	    LINK_STATE_IS_UP(iface->linkstate)))
+	if (!(iface->flags & IFF_UP) ||
+	    (!LINK_STATE_IS_UP(iface->linkstate) &&
+	    !(iface->if_type == IFT_CARP &&
+	    iface->linkstate == LINK_STATE_DOWN)))
 		return (0);
 
-	if (iface->media_type == IFT_CARP && iface->passive == 0) {
+	if (iface->if_type == IFT_CARP && iface->passive == 0) {
 		/* force passive mode on carp interfaces */
 		log_warnx("if_act_start: forcing interface %s to passive",
 		    iface->name);
@@ -637,7 +627,7 @@ if_to_ctl(struct iface *iface)
 	ictl.rxmt_interval = iface->rxmt_interval;
 	ictl.type = iface->type;
 	ictl.linkstate = iface->linkstate;
-	ictl.mediatype = iface->media_type;
+	ictl.if_type = iface->if_type;
 	ictl.priority = iface->priority;
 	ictl.passive = iface->passive;
 	ictl.auth_type = iface->auth_type;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfd.h,v 1.91 2013/01/17 10:07:56 markus Exp $ */
+/*	$OpenBSD: ospfd.h,v 1.97 2017/01/24 04:24:25 benno Exp $ */
 
 /*
  * Copyright (c) 2004 Esben Norby <norby@openbsd.org>
@@ -31,6 +31,7 @@
 
 #include <imsg.h>
 #include "ospf.h"
+#include "log.h"
 
 #define CONF_FILE		"/etc/ospfd.conf"
 #define	OSPFD_SOCKET		"/var/run/ospfd.sock"
@@ -59,7 +60,12 @@
 #define	F_REJECT		0x0040
 #define	F_BLACKHOLE		0x0080
 #define	F_REDISTRIBUTED		0x0100
-#define	F_FORCED_NEXTHOP	0x0200
+
+static const char * const log_procnames[] = {
+	"parent",
+	"ospfe",
+	"rde"
+};
 
 struct imsgev {
 	struct imsgbuf		 ibuf;
@@ -104,6 +110,7 @@ enum imsg_type {
 	IMSG_NEIGHBOR_CAPA,
 	IMSG_NETWORK_ADD,
 	IMSG_NETWORK_DEL,
+	IMSG_AREA_CHANGE,
 	IMSG_DD,
 	IMSG_DD_END,
 	IMSG_DD_BADLSA,
@@ -335,6 +342,7 @@ struct iface {
 	u_int32_t		 crypt_seq_num;
 	time_t			 uptime;
 	unsigned int		 ifindex;
+	u_int			 rdomain;
 	int			 fd;
 	int			 state;
 	int			 mtu;
@@ -345,7 +353,7 @@ struct iface {
 	u_int16_t		 metric;
 	enum iface_type		 type;
 	enum auth_type		 auth_type;
-	u_int8_t		 media_type;
+	u_int8_t		 if_type;
 	u_int8_t		 auth_keyid;
 	u_int8_t		 linkstate;
 	u_int8_t		 priority;
@@ -415,8 +423,9 @@ struct kif {
 	u_int64_t		 baudrate;
 	int			 flags;
 	int			 mtu;
-	u_short			 ifindex;
-	u_int8_t		 media_type;
+	unsigned int		 ifindex;
+	u_int			 rdomain;
+	u_int8_t		 if_type;
 	u_int8_t		 link_state;
 	u_int8_t		 nh_reachable;	/* for nexthop verification */
 };
@@ -461,7 +470,7 @@ struct ctl_iface {
 	u_int16_t		 rxmt_interval;
 	enum iface_type		 type;
 	u_int8_t		 linkstate;
-	u_int8_t		 mediatype;
+	u_int8_t		 if_type;
 	u_int8_t		 priority;
 	u_int8_t		 passive;
 	enum auth_type		 auth_type;
@@ -499,6 +508,7 @@ struct ctl_rt {
 	enum dst_type		 d_type;
 	u_int8_t		 flags;
 	u_int8_t		 prefixlen;
+	u_int8_t		 connected;
 };
 
 struct ctl_sum {
@@ -530,7 +540,7 @@ struct demote_msg {
 struct area	*area_new(void);
 int		 area_del(struct area *);
 struct area	*area_find(struct ospfd_conf *, struct in_addr);
-void		 area_track(struct area *, int);
+void		 area_track(struct area *);
 int		 area_border_router(struct ospfd_conf *);
 u_int8_t	 area_ospf_options(struct area *);
 
@@ -552,6 +562,7 @@ u_int16_t	 iso_cksum(void *, u_int16_t, u_int16_t);
 
 /* kroute.c */
 int		 kif_init(void);
+void		 kif_clear(void);
 int		 kr_init(int, u_int);
 int		 kr_change(struct kroute *, int);
 int		 kr_delete(struct kroute *);
@@ -568,7 +579,7 @@ void		 kr_reload(void);
 u_int8_t	mask2prefixlen(in_addr_t);
 in_addr_t	prefixlen2mask(u_int8_t);
 
-/* log.h */
+/* logmsg.h */
 const char	*nbr_state_name(int);
 const char	*if_state_name(int);
 const char	*if_type_name(enum iface_type);

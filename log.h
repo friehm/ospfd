@@ -1,4 +1,4 @@
-/*	$OpenBSD: log.h,v 1.6 2014/11/03 07:40:31 bluhm Exp $ */
+/*	$OpenBSD: log.h,v 1.10 2017/01/24 04:24:25 benno Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -16,20 +16,31 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef _LOG_H_
-#define	_LOG_H_
+#ifndef LOG_H
+#define LOG_H
 
 #include <stdarg.h>
+#include <sys/cdefs.h>
 
-void	log_init(int);
-void	log_verbose(int);
-void	logit(int, const char *, ...);
-void	vlog(int, const char *, va_list);
-void	log_warn(const char *, ...);
-void	log_warnx(const char *, ...);
-void	log_info(const char *, ...);
-void	log_debug(const char *, ...);
-void	fatal(const char *) __dead;
-void	fatalx(const char *) __dead;
+void	log_init(int, int);
+void	log_procinit(const char *);
+void	log_setverbose(int);
+int	log_getverbose(void);
+void	log_warn(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	log_warnx(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	log_info(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	log_debug(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	logit(int, const char *, ...)
+	    __attribute__((__format__ (printf, 2, 3)));
+void	vlog(int, const char *, va_list)
+	    __attribute__((__format__ (printf, 2, 0)));
+__dead void fatal(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+__dead void fatalx(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
 
-#endif /* _LOG_H_ */
+#endif /* LOG_H */

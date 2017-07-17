@@ -1,4 +1,4 @@
-/*	$OpenBSD: kroute.c,v 1.95 2015/01/16 06:40:19 deraadt Exp $ */
+/*	$OpenBSD: kroute.c,v 1.107 2016/12/27 09:15:16 jca Exp $ */
 
 /*
  * Copyright (c) 2004 Esben Norby <norby@openbsd.org>
@@ -85,7 +85,6 @@ void			 kroute_clear(void);
 struct kif_node		*kif_find(u_short);
 struct kif_node		*kif_insert(u_short);
 int			 kif_remove(struct kif_node *);
-void			 kif_clear(void);
 struct kif		*kif_update(u_short, int, struct if_data *,
 			    struct sockaddr_dl *);
 int			 kif_validate(u_short);
@@ -106,26 +105,21 @@ int		send_rtmsg(int, int, struct kroute *);
 int		dispatch_rtmsg(void);
 int		fetchtable(void);
 int		fetchifs(u_short);
-int		rtmsg_process(char *, int);
+int		rtmsg_process(char *, size_t);
 void		kr_fib_reload_timer(int, short, void *);
 void		kr_fib_reload_arm_timer(int);
 
-RB_HEAD(kroute_tree, kroute_node)	krt;
+RB_HEAD(kroute_tree, kroute_node)	krt = RB_INITIALIZER(&krt);
 RB_PROTOTYPE(kroute_tree, kroute_node, entry, kroute_compare)
 RB_GENERATE(kroute_tree, kroute_node, entry, kroute_compare)
 
-RB_HEAD(kif_tree, kif_node)		kit;
+RB_HEAD(kif_tree, kif_node)		kit = RB_INITIALIZER(&kit);
 RB_PROTOTYPE(kif_tree, kif_node, entry, kif_compare)
 RB_GENERATE(kif_tree, kif_node, entry, kif_compare)
 
 int
 kif_init(void)
 {
-	RB_INIT(&kit);
-	/* init also krt tree so that we can call kr_shutdown() */
-	RB_INIT(&krt);
-	kr_state.fib_sync = 0;	/* decoupled */
-
 	if (fetchifs(0) == -1)
 		return (-1);
 
@@ -141,7 +135,8 @@ kr_init(int fs, u_int rdomain)
 	kr_state.fib_sync = fs;
 	kr_state.rdomain = rdomain;
 
-	if ((kr_state.fd = socket(AF_ROUTE, SOCK_RAW, AF_INET)) == -1) {
+	if ((kr_state.fd = socket(AF_ROUTE,
+	    SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, AF_INET)) == -1) {
 		log_warn("kr_init: socket");
 		return (-1);
 	}
@@ -495,7 +490,7 @@ kr_ifinfo(char *ifname, pid_t pid)
 void
 kr_redist_remove(struct kroute_node *kh, struct kroute_node *kn)
 {
-	struct kroute	*rr;
+	struct kroute	*kr;
 
 	/* was the route redistributed? */
 	if ((kn->r.flags & F_REDISTRIBUTED) == 0)
@@ -503,7 +498,7 @@ kr_redist_remove(struct kroute_node *kh, struct kroute_node *kn)
 
 	/* remove redistributed flag */
 	kn->r.flags &= ~F_REDISTRIBUTED;
-	rr = &kn->r;
+	kr = &kn->r;
 
 	/* probably inform the RDE (check if no other path is redistributed) */
 	for (kn = kh; kn; kn = kn->next)
@@ -511,12 +506,12 @@ kr_redist_remove(struct kroute_node *kh, struct kroute_node *kn)
 			break;
 
 	if (kn == NULL)
-		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, rr,
+		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, kr,
 		    sizeof(struct kroute));
 }
 
 int
-kr_redist_eval(struct kroute *kr, struct kroute *rr)
+kr_redist_eval(struct kroute *kr, struct kroute *new_kr)
 {
 	u_int32_t	 a, metric = 0;
 
@@ -558,9 +553,9 @@ kr_redist_eval(struct kroute *kr, struct kroute *rr)
 	 * only one of all multipath routes can be redistributed so
 	 * redistribute the best one.
 	 */
-	if (rr->metric > metric) {
-		*rr = *kr;
-		rr->metric = metric;
+	if (new_kr->metric > metric) {
+		*new_kr = *kr;
+		new_kr->metric = metric;
 	}
 
 	return (1);
@@ -578,28 +573,28 @@ void
 kr_redistribute(struct kroute_node *kh)
 {
 	struct kroute_node	*kn;
-	struct kroute		 rr;
+	struct kroute		 kr;
 	int			 redistribute = 0;
 
 	/* only the highest prio route can be redistributed */
 	if (kroute_find(kh->r.prefix.s_addr, kh->r.prefixlen, RTP_ANY) != kh)
 		return;
 
-	bzero(&rr, sizeof(rr));
-	rr.metric = UINT_MAX;
+	bzero(&kr, sizeof(kr));
+	kr.metric = UINT_MAX;
 	for (kn = kh; kn; kn = kn->next)
-		if (kr_redist_eval(&kn->r, &rr))
+		if (kr_redist_eval(&kn->r, &kr))
 			redistribute = 1;
 
 	if (!redistribute)
 		return;
 
-	if (rr.flags & F_REDISTRIBUTED) {
-		main_imsg_compose_rde(IMSG_NETWORK_ADD, 0, &rr,
+	if (kr.flags & F_REDISTRIBUTED) {
+		main_imsg_compose_rde(IMSG_NETWORK_ADD, 0, &kr,
 		    sizeof(struct kroute));
 	} else {
-		rr = kh->r;
-		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, &rr,
+		kr = kh->r;
+		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, &kr,
 		    sizeof(struct kroute));
 	}
 }
@@ -882,9 +877,10 @@ kif_update(u_short ifindex, int flags, struct if_data *ifd,
 
 	kif->k.flags = flags;
 	kif->k.link_state = ifd->ifi_link_state;
-	kif->k.media_type = ifd->ifi_type;
+	kif->k.if_type = ifd->ifi_type;
 	kif->k.baudrate = ifd->ifi_baudrate;
 	kif->k.mtu = ifd->ifi_mtu;
+	kif->k.rdomain = ifd->ifi_rdomain;
 
 	if (sdl && sdl->sdl_family == AF_LINK) {
 		if (sdl->sdl_nlen >= sizeof(kif->k.ifname))
@@ -1018,6 +1014,9 @@ if_change(u_short ifindex, int flags, struct if_data *ifd,
 		return;
 	}
 
+	/* notify ospfe about interface link state */
+	main_imsg_compose_ospfe(IMSG_IFINFO, 0, kif, sizeof(struct kif));
+
 	reachable = (kif->flags & IFF_UP) &&
 	    LINK_STATE_IS_UP(kif->link_state);
 
@@ -1025,9 +1024,6 @@ if_change(u_short ifindex, int flags, struct if_data *ifd,
 		return;		/* nothing changed wrt nexthop validity */
 
 	kif->nh_reachable = reachable;
-
-	/* notify ospfe about interface link state */
-	main_imsg_compose_ospfe(IMSG_IFINFO, 0, kif, sizeof(struct kif));
 
 	/* update redistribute list */
 	RB_FOREACH(kr, kroute_tree, &krt) {
@@ -1306,6 +1302,8 @@ dispatch_rtmsg(void)
 	ssize_t			 n;
 
 	if ((n = read(kr_state.fd, &buf, sizeof(buf))) == -1) {
+		if (errno == EAGAIN || errno == EINTR)
+			return (0);
 		log_warn("dispatch_rtmsg: read error");
 		return (-1);
 	}
@@ -1319,7 +1317,7 @@ dispatch_rtmsg(void)
 }
 
 int
-rtmsg_process(char *buf, int len)
+rtmsg_process(char *buf, size_t len)
 {
 	struct rt_msghdr	*rtm;
 	struct if_msghdr	 ifm;
@@ -1334,12 +1332,15 @@ rtmsg_process(char *buf, int len)
 	u_short			 ifindex = 0;
 	int			 rv, delay;
 
-	int			 offset;
+	size_t			 offset;
 	char			*next;
 
 	for (offset = 0; offset < len; offset += rtm->rtm_msglen) {
 		next = buf + offset;
 		rtm = (struct rt_msghdr *)next;
+		if (len < offset + sizeof(u_short) ||
+		    len < offset + rtm->rtm_msglen)
+			fatalx("rtmsg_process: partial rtm in buffer");
 		if (rtm->rtm_version != RTM_VERSION)
 			continue;
 
@@ -1364,10 +1365,15 @@ rtmsg_process(char *buf, int len)
 			if (rtm->rtm_tableid != kr_state.rdomain)
 				continue;
 
+			if (rtm->rtm_type == RTM_GET &&
+			    rtm->rtm_pid != kr_state.pid)
+				continue;
+
 			if ((sa = rti_info[RTAX_DST]) == NULL)
 				continue;
 
-			if (rtm->rtm_flags & RTF_LLINFO)	/* arp cache */
+			/* Skip ARP/ND cache and broadcast routes. */
+			if (rtm->rtm_flags & (RTF_LLINFO|RTF_BROADCAST))
 				continue;
 
 			if (rtm->rtm_flags & RTF_MPATH)
@@ -1408,10 +1414,19 @@ rtmsg_process(char *buf, int len)
 			if ((sa = rti_info[RTAX_GATEWAY]) != NULL) {
 				switch (sa->sa_family) {
 				case AF_INET:
+					if (rtm->rtm_flags & RTF_CONNECTED) {
+						flags |= F_CONNECTED;
+						break;
+					}
+
 					nexthop.s_addr = ((struct
 					    sockaddr_in *)sa)->sin_addr.s_addr;
 					break;
 				case AF_LINK:
+					/*
+					 * Traditional BSD connected routes have
+					 * a gateway of type AF_LINK.
+					 */
 					flags |= F_CONNECTED;
 					break;
 				}
